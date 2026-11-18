@@ -19,12 +19,13 @@ from datetime import datetime
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 
-# Tuned by leave-one-out over the comparables (rolling/console launches).
+# Tuned by leave-one-out over the comparables (rolling/console launches): the
+# spread across analogs already widens through the day, so each analog's own
+# kernel stays a constant width.
 BANDWIDTH = 1.0
 FEATURE_SCALE = (1.0, 1.0, 1.0, 0.2)
 PRIOR_POWER = 2.0
-KERNEL_SD_BASE = 0.10
-KERNEL_SD_SLOPE = 0.03
+KERNEL_SD = 0.12
 # Minute-trend nudge: share of the hour-1 tail trend carried into hour 2,
 # decaying by this factor each further hour.
 TREND_CARRY = 0.6
@@ -94,9 +95,22 @@ def launch_prior(comparable):
     return w
 
 
+def is_target_history(comp, twitch_id):
+    """A comparable that is the case's own pre-release category history, not a launch."""
+    unlock = (comp.get("unlock") or "").lower()
+    source = comp.get("source") or ""
+    if "tier: target-history" in unlock:
+        return True
+    return bool(twitch_id) and source.rstrip(")/ ").endswith("_" + twitch_id)
+
+
+def case_twitch_id(case):
+    return str((case.get("game") or {}).get("twitch_id") or "")
+
+
 def analogs_of(case):
     out = []
-    gid = str((case.get("game") or {}).get("twitch_id") or "")
+    gid = case_twitch_id(case)
     for comp in case.get("comparables") or []:
         if is_target_history(comp, gid):
             continue
@@ -110,15 +124,6 @@ def analogs_of(case):
             continue
         out.append((features(series), ratios, launch_prior(comp)))
     return out
-
-
-def is_target_history(comp, twitch_id):
-    """A comparable that is the case's own pre-release category history, not a launch."""
-    unlock = (comp.get("unlock") or "").lower()
-    source = comp.get("source") or ""
-    if "tier: target-history" in unlock:
-        return True
-    return bool(twitch_id) and source.rstrip(")/ ").endswith("_" + twitch_id)
 
 
 def target_series(case):
@@ -136,7 +141,7 @@ def target_series(case):
     # The case's own category history may sit among the comparables (the final
     # carries GTA VI's, tier target-history, its source URL ending in the game
     # id): use it for the quiet weeks the recorder's short history does not reach.
-    gid = str((case.get("game") or {}).get("twitch_id") or "")
+    gid = case_twitch_id(case)
     for comp in case.get("comparables") or []:
         if not is_target_history(comp, gid):
             continue
@@ -167,16 +172,16 @@ def normal_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def mixture_quantiles(means, sds, weights, levels):
+def mixture_quantiles(means, sd, weights, levels):
     total = sum(weights)
-    lo0 = min(m - 6 * s for m, s in zip(means, sds))
-    hi0 = max(m + 6 * s for m, s in zip(means, sds))
+    lo0 = min(means) - 6 * sd
+    hi0 = max(means) + 6 * sd
     out = []
     for tau in levels:
         lo, hi = lo0, hi0
         for _ in range(40):
             mid = (lo + hi) / 2
-            c = sum(w * normal_cdf((mid - m) / s) for m, s, w in zip(means, sds, weights)) / total
+            c = sum(w * normal_cdf((mid - m) / sd) for m, w in zip(means, weights)) / total
             if c < tau:
                 lo = mid
             else:
@@ -188,6 +193,21 @@ def mixture_quantiles(means, sds, weights, levels):
 def baseline_logs(h):
     z = [-1.6448536, -0.6744898, 0.0, 0.6744898, 1.6448536]
     return [zz * 0.15 * math.sqrt(h - 1) for zz in z]
+
+
+def forecast_hours(case):
+    return [row["hour"] for row in case.get("forecast") or []] or list(range(2, 25))
+
+
+def to_row(h, print_1, logs, shift=0.0):
+    q = []
+    for x in logs:
+        value = print_1 * math.exp(x + shift)
+        value = round(min(max(value, 0.01), 1e9), 2)
+        if q and value < q[-1]:
+            value = q[-1]
+        q.append(value)
+    return {"hour": h, "q": q}
 
 
 def forecast(case):
@@ -204,26 +224,22 @@ def forecast(case):
         weights = [prior ** PRIOR_POWER for _, _, prior in analogs]
 
     trend = minute_trend(case)
-    hours = [row["hour"] for row in case.get("forecast") or []] or list(range(2, 25))
     rows = []
-    for h in hours:
-        means, sds, ws = [], [], []
+    for h in forecast_hours(case):
+        means, ws = [], []
         for (_, ratios, _), w in zip(analogs, weights):
             if h in ratios and w > 0:
                 means.append(ratios[h])
-                sds.append(KERNEL_SD_BASE + KERNEL_SD_SLOPE * math.sqrt(h - 1))
                 ws.append(w)
-        logs = mixture_quantiles(means, sds, ws, levels) if ws else baseline_logs(h)
-        shift = trend * TREND_CARRY * TREND_DECAY ** (h - 2)
-        q = []
-        for x in logs:
-            value = print_1 * math.exp(x + shift)
-            value = round(min(max(value, 0.01), 1e9), 2)
-            if q and value < q[-1]:
-                value = q[-1]
-            q.append(value)
-        rows.append({"hour": h, "q": q})
+        logs = mixture_quantiles(means, KERNEL_SD, ws, levels) if ws else baseline_logs(h)
+        rows.append(to_row(h, print_1, logs, trend * TREND_CARRY * TREND_DECAY ** (h - 2)))
     return {"hours": rows}
+
+
+def fallback(case):
+    """The persistence baseline, for a case the model cannot read."""
+    print_1 = max(float(case["known"][0]["viewers"]), 1.0)
+    return {"hours": [to_row(h, print_1, baseline_logs(h)) for h in forecast_hours(case)]}
 
 
 def main():
@@ -237,11 +253,7 @@ def main():
         try:
             result = forecast(case)
         except Exception:
-            p = max(float(case["known"][0]["viewers"]), 1.0)
-            result = {"hours": [
-                {"hour": h, "q": [round(p * math.exp(x), 2) for x in baseline_logs(h)]}
-                for h in range(2, 25)
-            ]}
+            result = fallback(case)
         with open(os.path.join(out_dir, case_id + ".out"), "w", encoding="utf-8") as f:
             json.dump(result, f, separators=(",", ":"))
 
