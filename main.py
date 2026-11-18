@@ -1,233 +1,237 @@
-#!/usr/bin/env python3
-"""Launch-day Twitch viewer forecast for Grand Theft Auto VI (make.fun gta6-twitch-ccu-forecast-01).
+"""Launch-day Twitch viewer forecast: a kernel-weighted analog ensemble.
 
-Analog ensemble over past launches.  Every launch in the case's `comparables`
-gives a path of log ratios ln(v_h / v_1) over its own release day (hour 1 =
-00:00-01:00 UTC).  Each forecast hour is a weighted Gaussian-kernel mixture of
-those ratios.  A comparable's weight is
-
-    prior(unlock style, platforms, tier) x kernel(features seen at the checkpoint)
-
-where the features are the hour-1 size ln(v_1) and the hour-1 print against the
-highest hour of the 12 before it (has the launch surge already peaked?).  Big
-hour-1 prints that already sit below the pre-midnight peak stay flat for the
-day; small ones keep climbing.  Each ratio is also shifted by
-BETA x (size gap) so a target larger than every comparable is extrapolated.
-
-    python3 main.py              forecast every *.in in $MAKEFUN_INPUT_DIR
-    python3 main.py --loo DIR    leave-one-out backtest over the comparables in DIR
+For every past launch in the case's comparables, the log ratio of each hour of
+its release day to its hour 1 is one analog path. Analogs are weighted by how
+much their run-up into hour 1 looks like the case's own (growth over the last
+hour, over the last six hours, against the previous day's peak and against the
+quiet weeks before) and by a prior on the kind of launch (rolling midnight
+unlock, console-only, early access). Each analog contributes a normal kernel in
+log space; the five quantiles of each hour are read off the weighted mixture.
+When the case carries minute reads inside hour 1, the trend over its last
+minutes nudges the first hours of the forecast.
 """
+
+import glob
 import json
 import math
 import os
-import re
-import sys
 from datetime import datetime
 
-LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
-Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
-HOURS = range(2, 25)
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+GTA_TWITCH_ID = "1867279146"
 
-# Tuned by leave-one-out over the comparables (see --loo); chosen on a flat plateau.
-PARAMS = {
-    "pc_weight": 0.35,        # launches that include PC, often on their own unlock clock
-    "global_weight": 0.15,    # single worldwide unlock time instead of rolling midnight
-    "early_weight": 0.5,      # early-access contaminated release day
-    "weak_weight": 0.2,       # free-to-play / slow-burn launches
-    "small_weight": 0.2,      # hour 1 below `small_v1` viewers: launch not yet started
-    "small_v1": 2000.0,
-    "size_bw": 1.0,           # kernel bandwidth on ln(v_1)
-    "peak_bw": 0.5,           # kernel bandwidth on ln(v_1 / max of hours -11..0)
-    "beta": -0.1,             # log-ratio shift per unit of ln(v_1) gap (bigger -> flatter)
-    "bw0": 0.10,              # mixture bandwidth at hour 2 (log units)
-    "bw1": 0.06,              # bandwidth growth per sqrt(hour - 1)
-}
+# Tuned by leave-one-out over the comparables (rolling/console launches).
+BANDWIDTH = 1.0
+FEATURE_SCALE = (1.0, 1.0, 1.0, 0.2)
+PRIOR_POWER = 2.0
+KERNEL_SD_BASE = 0.10
+KERNEL_SD_SLOPE = 0.03
+# Minute-trend nudge: share of the hour-1 tail trend carried into hour 2,
+# decaying by this factor each further hour.
+TREND_CARRY = 0.6
+TREND_DECAY = 0.6
 
 
-def parse_ts(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def parse_time(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def hour_of(day_start, at):
-    """Release-day hour number (1 = 00:00-01:00 UTC) holding instant `at`."""
-    return int((at - day_start).total_seconds() // 3600) + 1
+def hour_index(start, at):
+    return int((parse_time(at) - start).total_seconds() // 3600)
 
 
-def hourly_map(day_start, rows):
-    ds = parse_ts(day_start)
+def safe_log(x):
+    return math.log(max(float(x), 1.0))
+
+
+def hourly_map(rows, start, key="from"):
+    """Hour offset from `start` -> viewers, for rows with a viewers count."""
     out = {}
-    for r in rows or []:
-        v = r.get("viewers")
-        if v is not None:
-            out[hour_of(ds, parse_ts(r["from"]))] = v
+    for row in rows or []:
+        v = row.get("viewers")
+        if v is None or row.get(key) is None:
+            continue
+        out[hour_index(start, row[key])] = float(v)
     return out
 
 
-def features(series, v1):
-    """(ln v_1, ln(v_1 / max of hours -11..0) or None)."""
-    pre = [series[k] for k in range(-11, 1) if k in series]
-    peak = math.log(max(v1, 1) / max(max(pre), 1)) if pre else None
-    return math.log(max(v1, 1)), peak
+def features(series):
+    """Run-up features of a launch, from its hourly map relative to day start."""
+    v1 = series.get(0)
+    lv = safe_log(v1)
+    last6 = [series[k] for k in range(-6, 0) if k in series]
+    last24 = [series[k] for k in range(-24, 0) if k in series]
+    quiet = sorted(series[k] for k in range(-14 * 24, -24) if k in series)
+    growth_1h = lv - safe_log(last6[-1]) if last6 else 0.0
+    growth_6h = lv - safe_log(sum(last6) / len(last6)) if last6 else 0.0
+    vs_peak = lv - safe_log(max(last24)) if last24 else 0.0
+    if quiet:
+        mid = len(quiet) // 2
+        median = quiet[mid] if len(quiet) % 2 else (quiet[mid - 1] + quiet[mid]) / 2
+        vs_quiet = lv - safe_log(median)
+    else:
+        vs_quiet = 3.0
+    return (growth_1h, growth_6h, vs_peak, vs_quiet)
 
 
-class Analog:
-    __slots__ = ("name", "v1", "ratios", "prior", "feat", "console", "glob")
-
-    def __init__(self, comp, prm):
-        s = hourly_map(comp["day_start"], comp.get("hourly"))
-        self.name = comp["name"]
-        self.v1 = s.get(1) or 0
-        self.ratios = {}
-        if self.v1 > 0:
-            self.ratios = {h: math.log(max(s[h], 1) / self.v1) for h in HOURS if h in s}
-        unlock = comp.get("unlock", "").lower()
-        plat = comp.get("platforms", "").lower()
-        tier = re.search(r"tier:\s*([a-z-]+)", unlock)
-        tier = tier.group(1) if tier else ""
-        self.console = "pc" not in plat
-        self.glob = bool(re.search(
-            r"single (simultaneous )?global|simultaneous global|simultaneous across|single time", unlock))
-        w = 0.0 if tier == "target-history" or not self.ratios else 1.0
-        if not self.console:
-            w *= prm["pc_weight"]
-        if self.glob:
-            w *= prm["global_weight"]
-        if tier == "early-access-contaminated":
-            w *= prm["early_weight"]
-        elif tier == "weak":
-            w *= prm["weak_weight"]
-        if self.v1 < prm["small_v1"]:
-            w *= prm["small_weight"]
-        self.prior = w
-        self.feat = features(s, self.v1) if self.v1 > 0 else (0.0, None)
+def launch_prior(comparable):
+    unlock = (comparable.get("unlock") or "").lower()
+    platforms = (comparable.get("platforms") or "").lower()
+    rolling = "midnight local" in unlock
+    early = ("early access" in unlock and "no early access" not in unlock) or "early-access" in unlock
+    simultaneous = "simultaneous" in unlock or "single global" in unlock
+    console_only = "pc" not in platforms
+    w = 1.0
+    if early:
+        w *= 0.4
+    if "tier: weak" in unlock:
+        w *= 0.3
+    if rolling:
+        w *= 2.0
+    if console_only:
+        w *= 1.5
+    if simultaneous and not rolling:
+        w *= 0.5
+    return w
 
 
-def kernel(a, b, prm):
-    k = math.exp(-0.5 * ((a[0] - b[0]) / prm["size_bw"]) ** 2)
-    if a[1] is not None and b[1] is not None:
-        k *= math.exp(-0.5 * ((a[1] - b[1]) / prm["peak_bw"]) ** 2)
-    return k
+def analogs_of(case):
+    out = []
+    for comp in case.get("comparables") or []:
+        start = parse_time(comp["day_start"])
+        series = hourly_map(comp.get("hourly"), start)
+        if series.get(0) is None:
+            continue  # no hour 1 on its day (e.g. the target's own pre-release history)
+        base = safe_log(series[0])
+        ratios = {h: safe_log(series[h - 1]) - base for h in range(2, 25) if (h - 1) in series}
+        if not ratios:
+            continue
+        out.append((features(series), ratios, launch_prior(comp)))
+    return out
 
 
-def norm_cdf(x):
+def target_series(case):
+    start = parse_time(case["day_start"])
+    series = hourly_map(case.get("history_hourly"), start)
+    if not series:
+        # Fall back to bucketing the raw points into hours.
+        buckets = {}
+        for p in case.get("history") or []:
+            if p.get("viewers") is None:
+                continue
+            buckets.setdefault(hour_index(start, p["at"]), []).append(float(p["viewers"]))
+        series = {k: sum(v) / len(v) for k, v in buckets.items()}
+    series[0] = float(case["known"][0]["viewers"])
+    # The GTA VI category's own long history sits among the comparables: use it
+    # for the quiet weeks the recorder's short history does not reach.
+    gid = str((case.get("game") or {}).get("twitch_id") or "")
+    for comp in case.get("comparables") or []:
+        name = (comp.get("name") or "").lower()
+        if gid == GTA_TWITCH_ID and name.startswith("grand theft auto vi") and "before" in name:
+            for k, v in hourly_map(comp.get("hourly"), start).items():
+                if k < 0 and k not in series:
+                    series[k] = v
+    return series
+
+
+def minute_trend(case):
+    """Log of the last 15 minutes' mean over the hour-1 print, when minute reads exist."""
+    start = parse_time(case["day_start"])
+    checkpoint = parse_time(case["checkpoint"])
+    tail = []
+    for p in case.get("history") or []:
+        if p.get("viewers") is None:
+            continue
+        t = parse_time(p["at"])
+        if start <= t < checkpoint and (checkpoint - t).total_seconds() <= 15 * 60:
+            tail.append(float(p["viewers"]))
+    if len(tail) < 5:
+        return 0.0
+    trend = safe_log(sum(tail) / len(tail)) - safe_log(case["known"][0]["viewers"])
+    return max(-0.5, min(0.5, trend))
+
+
+def normal_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def mixture_quantile(points, bw, tau):
-    """Quantile of sum_i w_i N(x_i, bw^2); points = [(x, w)] with sum w = 1."""
-    lo = min(x for x, _ in points) - 8 * bw
-    hi = max(x for x, _ in points) + 8 * bw
-    for _ in range(60):
-        mid = 0.5 * (lo + hi)
-        if sum(w * norm_cdf((mid - x) / bw) for x, w in points) < tau:
-            lo = mid
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
-
-
-def forecast_logs(feat, analogs, prm):
-    """{h: [5 log ratios to hour 1]} for a target with features `feat`."""
-    pool = []
-    for a in analogs:
-        w = a.prior * kernel(feat, a.feat, prm) if a.prior > 0 else 0.0
-        if w > 1e-12:
-            pool.append((w, prm["beta"] * (feat[0] - a.feat[0]), a.ratios))
-    out = {}
-    for h in HOURS:
-        bw = prm["bw0"] + prm["bw1"] * math.sqrt(h - 1)
-        pts = [(r[h] + shift, w) for w, shift, r in pool if h in r]
-        tot = sum(w for _, w in pts)
-        if not pts or tot <= 0:
-            out[h] = [z * (0.15 * math.sqrt(h - 1)) for z in Z]
-            continue
-        pts = [(x, w / tot) for x, w in pts]
-        out[h] = [mixture_quantile(pts, bw, t) for t in LEVELS]
+def mixture_quantiles(means, sds, weights, levels):
+    total = sum(weights)
+    lo0 = min(m - 6 * s for m, s in zip(means, sds))
+    hi0 = max(m + 6 * s for m, s in zip(means, sds))
+    out = []
+    for tau in levels:
+        lo, hi = lo0, hi0
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            c = sum(w * normal_cdf((mid - m) / s) for m, s, w in zip(means, sds, weights)) / total
+            if c < tau:
+                lo = mid
+            else:
+                hi = mid
+        out.append((lo + hi) / 2)
     return out
 
 
-def format_rows(p1, logs):
+def baseline_logs(h):
+    z = [-1.6448536, -0.6744898, 0.0, 0.6744898, 1.6448536]
+    return [zz * 0.15 * math.sqrt(h - 1) for zz in z]
+
+
+def forecast(case):
+    levels = case.get("levels") or LEVELS
+    print_1 = max(float(case["known"][0]["viewers"]), 1.0)
+    target = features(target_series(case))
+    analogs = analogs_of(case)
+
+    weights = []
+    for feats, _, prior in analogs:
+        d2 = sum(((a - b) * s) ** 2 for a, b, s in zip(feats, target, FEATURE_SCALE))
+        weights.append(prior ** PRIOR_POWER * math.exp(-d2 / (2 * BANDWIDTH ** 2)))
+    if sum(weights) <= 1e-300:
+        weights = [prior ** PRIOR_POWER for _, _, prior in analogs]
+
+    trend = minute_trend(case)
+    hours = [row["hour"] for row in case.get("forecast") or []] or list(range(2, 25))
     rows = []
-    for h in HOURS:
-        q, prev = [], 0.01
-        for lr in logs[h]:
-            v = min(max(round(p1 * math.exp(lr), 2), prev, 0.01), 1e9)
-            q.append(v)
-            prev = v
+    for h in hours:
+        means, sds, ws = [], [], []
+        for (_, ratios, _), w in zip(analogs, weights):
+            if h in ratios and w > 0:
+                means.append(ratios[h])
+                sds.append(KERNEL_SD_BASE + KERNEL_SD_SLOPE * math.sqrt(h - 1))
+                ws.append(w)
+        logs = mixture_quantiles(means, sds, ws, levels) if ws else baseline_logs(h)
+        shift = trend * TREND_CARRY * TREND_DECAY ** (h - 2)
+        q = []
+        for x in logs:
+            value = print_1 * math.exp(x + shift)
+            value = round(min(max(value, 0.01), 1e9), 2)
+            if q and value < q[-1]:
+                value = q[-1]
+            q.append(value)
         rows.append({"hour": h, "q": q})
-    return rows
-
-
-def forecast_case(case, prm=PARAMS):
-    p1 = max(float(case["known"][0]["viewers"]), 1.0)
-    series = hourly_map(case["day_start"], case.get("history_hourly"))
-    series[1] = p1
-    analogs = [Analog(c, prm) for c in case.get("comparables") or []]
-    return {"hours": format_rows(p1, forecast_logs(features(series, p1), analogs, prm))}
-
-
-def pinball(y, qs):
-    """Mean over the five levels of the contest's log-scale pinball loss."""
-    ly = math.log(max(y, 1))
-    tot = 0.0
-    for tau, q in zip(LEVELS, qs):
-        d = ly - math.log(q)
-        tot += 2 * max(tau * d, (tau - 1) * d)
-    return tot / len(LEVELS)
-
-
-def baseline_q(p1, h):
-    return [p1 * math.exp(z * 0.15 * math.sqrt(h - 1)) for z in Z]
-
-
-def loo(indir, prm=PARAMS, verbose=True):
-    comps = {}
-    for name in sorted(os.listdir(indir)):
-        if name.endswith(".in"):
-            with open(os.path.join(indir, name), encoding="utf-8") as f:
-                for c in json.load(f).get("comparables") or []:
-                    comps.setdefault(c["name"], c)
-    analogs = [Analog(c, prm) for c in comps.values()]
-    res = []
-    for t in analogs:
-        if t.prior <= 0:
-            continue
-        rest = [a for a in analogs if a is not t]
-        rows = {r["hour"]: r["q"] for r in format_rows(t.v1, forecast_logs(t.feat, rest, prm))}
-        ys = {h: t.v1 * math.exp(lr) for h, lr in t.ratios.items()}
-        ours = sum(pinball(y, rows[h]) for h, y in ys.items()) / len(ys)
-        base = sum(pinball(y, baseline_q(t.v1, h)) for h, y in ys.items()) / len(ys)
-        res.append((t, ours, base))
-    if verbose:
-        for t, a, b in res:
-            print(f"{t.name[:30]:30s} {'console' if t.console else 'pc     '} ours {a:.3f} base {b:.3f}")
-    subsets = (
-        ("all", res),
-        ("console-only", [r for r in res if r[0].console]),
-        ("target-like", [r for r in res if not r[0].glob and r[0].v1 > 5000]),
-    )
-    for label, sel in subsets:
-        if sel:
-            print(f"{label:13s} n={len(sel):2d} ours {sum(r[1] for r in sel) / len(sel):.4f}"
-                  f" base {sum(r[2] for r in sel) / len(sel):.4f}")
-    return res
+    return {"hours": rows}
 
 
 def main():
-    if len(sys.argv) >= 3 and sys.argv[1] == "--loo":
-        loo(sys.argv[2])
-        return
-    indir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(outdir, exist_ok=True)
-    for name in sorted(os.listdir(indir)):
-        if not name.endswith(".in"):
-            continue
-        with open(os.path.join(indir, name), encoding="utf-8") as f:
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input/"
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output/"
+    os.makedirs(out_dir, exist_ok=True)
+    for path in sorted(glob.glob(os.path.join(in_dir, "*.in"))):
+        with open(path, encoding="utf-8") as f:
             case = json.load(f)
-        out = forecast_case(case)
-        with open(os.path.join(outdir, name[:-3] + ".out"), "w", encoding="utf-8") as f:
-            json.dump(out, f, separators=(",", ":"))
+        case_id = case.get("id") or os.path.basename(path)[:-3]
+        try:
+            result = forecast(case)
+        except Exception:
+            p = max(float(case["known"][0]["viewers"]), 1.0)
+            result = {"hours": [
+                {"hour": h, "q": [round(p * math.exp(x), 2) for x in baseline_logs(h)]}
+                for h in range(2, 25)
+            ]}
+        with open(os.path.join(out_dir, case_id + ".out"), "w", encoding="utf-8") as f:
+            json.dump(result, f, separators=(",", ":"))
 
 
 if __name__ == "__main__":
