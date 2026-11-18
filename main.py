@@ -18,7 +18,6 @@ import os
 from datetime import datetime
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-GTA_TWITCH_ID = "1867279146"
 
 # Tuned by leave-one-out over the comparables (rolling/console launches).
 BANDWIDTH = 1.0
@@ -97,17 +96,29 @@ def launch_prior(comparable):
 
 def analogs_of(case):
     out = []
+    gid = str((case.get("game") or {}).get("twitch_id") or "")
     for comp in case.get("comparables") or []:
+        if is_target_history(comp, gid):
+            continue
         start = parse_time(comp["day_start"])
         series = hourly_map(comp.get("hourly"), start)
         if series.get(0) is None:
-            continue  # no hour 1 on its day (e.g. the target's own pre-release history)
+            continue  # no hour 1 on its release day
         base = safe_log(series[0])
         ratios = {h: safe_log(series[h - 1]) - base for h in range(2, 25) if (h - 1) in series}
         if not ratios:
             continue
         out.append((features(series), ratios, launch_prior(comp)))
     return out
+
+
+def is_target_history(comp, twitch_id):
+    """A comparable that is the case's own pre-release category history, not a launch."""
+    unlock = (comp.get("unlock") or "").lower()
+    source = comp.get("source") or ""
+    if "tier: target-history" in unlock:
+        return True
+    return bool(twitch_id) and source.rstrip(")/ ").endswith("_" + twitch_id)
 
 
 def target_series(case):
@@ -122,15 +133,16 @@ def target_series(case):
             buckets.setdefault(hour_index(start, p["at"]), []).append(float(p["viewers"]))
         series = {k: sum(v) / len(v) for k, v in buckets.items()}
     series[0] = float(case["known"][0]["viewers"])
-    # The GTA VI category's own long history sits among the comparables: use it
-    # for the quiet weeks the recorder's short history does not reach.
+    # The case's own category history may sit among the comparables (the final
+    # carries GTA VI's, tier target-history, its source URL ending in the game
+    # id): use it for the quiet weeks the recorder's short history does not reach.
     gid = str((case.get("game") or {}).get("twitch_id") or "")
     for comp in case.get("comparables") or []:
-        name = (comp.get("name") or "").lower()
-        if gid == GTA_TWITCH_ID and name.startswith("grand theft auto vi") and "before" in name:
-            for k, v in hourly_map(comp.get("hourly"), start).items():
-                if k < 0 and k not in series:
-                    series[k] = v
+        if not is_target_history(comp, gid):
+            continue
+        for k, v in hourly_map(comp.get("hourly"), start).items():
+            if k < 0 and k not in series:
+                series[k] = v
     return series
 
 
